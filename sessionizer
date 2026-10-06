@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+PROJECT_FOLDERS=("$HOME/Projects/" "$HOME/.config/")
+PROJECT=$(find ${PROJECT_FOLDERS[@]} -mindepth 1 -maxdepth 1 -type d  | fzf)
+
+if [ -n "$PROJECT" ]; then
+	SESSION_NAME=$(basename "$PROJECT" | tr . _)
+
+	EXACT_SESSION=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -Fx "$SESSION_NAME")
+
+	if [ -n "$EXACT_SESSION" ]; then
+		if [ -n "$TMUX" ]; then
+			tmux switch-client -t "$SESSION_NAME"
+		else 
+			exec tmux attach -t "$SESSION_NAME"
+		fi
+	else
+		tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT"
+		tmux new-window -t "$SESSION_NAME" -c "$PROJECT" "nvim"
+		tmux new-window -t "$SESSION_NAME" -c "$PROJECT"
+		tmux select-window -t "$SESSION_NAME:2"
+		if [ -n "$TMUX" ]; then
+			tmux switch-client -t "$SESSION_NAME"
+		else 
+			exec tmux attach -t "$SESSION_NAME"
+		fi
+	fi
+fi
