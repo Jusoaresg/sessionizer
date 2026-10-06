@@ -1,28 +1,65 @@
 #!/usr/bin/env bash
 
 PROJECT_FOLDERS=("$HOME/Projects/" "$HOME/.config/")
-PROJECT=$(find ${PROJECT_FOLDERS[@]} -mindepth 1 -maxdepth 1 -type d  | fzf)
 
-if [ -n "$PROJECT" ]; then
-	SESSION_NAME=$(basename "$PROJECT" | tr . _)
+CANDIDATES=$(
+  find "${PROJECT_FOLDERS[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r dir; do
+    base_folder=$(basename "$(dirname "$dir")")
+    item_name=$(basename "$dir")
+    printf "%s/%s\t%s\n" "$base_folder" "$item_name" "$dir"
+  done
 
-	EXACT_SESSION=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -Fx "$SESSION_NAME")
+  find "$HOME/Projects"/*/.worktrees -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r dir; do
+    parent_repo=$(basename "$(dirname "$(dirname "$dir")")")
+    wt_name=$(basename "$dir")
+    printf "Projects/%s [wt: %s]\t%s\n" "$parent_repo" "$wt_name" "$dir"
+  done
+)
 
-	if [ -n "$EXACT_SESSION" ]; then
-		if [ -n "$TMUX" ]; then
-			tmux switch-client -t "$SESSION_NAME"
-		else 
-			exec tmux attach -t "$SESSION_NAME"
-		fi
-	else
-		tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT"
-		tmux new-window -t "$SESSION_NAME" -c "$PROJECT" "nvim"
-		tmux new-window -t "$SESSION_NAME" -c "$PROJECT"
-		tmux select-window -t "$SESSION_NAME:2"
-		if [ -n "$TMUX" ]; then
-			tmux switch-client -t "$SESSION_NAME"
-		else 
-			exec tmux attach -t "$SESSION_NAME"
-		fi
-	fi
+SELECTED_LINE=$(echo -e "$CANDIDATES" | fzf --delimiter='\t' --with-nth=1)
+
+[[ -z "$SELECTED_LINE" ]] && exit 0
+
+PROJECT=$(echo "$SELECTED_LINE" | cut -f2)
+
+if [[ "$PROJECT" == *"/.worktrees/"* ]]; then
+  PARENT_PROJ=$(basename "$(dirname "$(dirname "$PROJECT")")")
+  WT_NAME=$(basename "$PROJECT")
+
+  SESSION_NAME="wt_${PARENT_PROJ}__${WT_NAME}"
+  IS_WORKTREE=true
+elif [[ "$PROJECT" == *"$HOME/.config"* ]]; then
+  SESSION_NAME="cfg_$(basename "$PROJECT" | tr . _)"
+  IS_WORKTREE=false
+else
+  SESSION_NAME=$(basename "$PROJECT" | tr . _)
+  IS_WORKTREE=false
+fi
+
+SESSION_NAME=$(echo "$SESSION_NAME" | tr . _)
+
+EXACT_SESSION=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -Fx "$SESSION_NAME")
+
+if [ -n "$EXACT_SESSION" ]; then
+  if [ -n "$TMUX" ]; then
+    tmux switch-client -t "$SESSION_NAME"
+  else
+    exec tmux attach -t "$SESSION_NAME"
+  fi
+else
+  tmux new-session -d -s "$SESSION_NAME" -n "term1" -c "$PROJECT"
+  tmux new-window -t "${SESSION_NAME}:2" -n "editor" -c "$PROJECT" "nvim"
+  tmux new-window -t "${SESSION_NAME}:3" -n "term2" -c "$PROJECT"
+  tmux select-window -t "${SESSION_NAME}:2"
+
+  if [ "$IS_WORKTREE" = true ]; then
+    tmux set-option -t "$SESSION_NAME" status-style "bg=#d75f00,fg=#000000,bold"
+    tmux set-option -t "$SESSION_NAME" status-left "  [WORKTREE: $WT_NAME] "
+  fi
+
+  if [ -n "$TMUX" ]; then
+    tmux switch-client -t "$SESSION_NAME"
+  else
+    exec tmux attach -t "$SESSION_NAME"
+  fi
 fi
