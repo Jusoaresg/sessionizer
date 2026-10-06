@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 
-PROJECT_FOLDERS=("$HOME/Projects/" "$HOME/.config/")
-
+# Use native fast scanning and string manipulation without subshells
 CANDIDATES=$(
-  find "${PROJECT_FOLDERS[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r dir; do
-    base_folder=$(basename "$(dirname "$dir")")
-    item_name=$(basename "$dir")
-    printf "%s/%s\t%s\n" "$base_folder" "$item_name" "$dir"
+  # 1. Standard project and config folders
+  find "$HOME/Projects" "$HOME/.config" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r dir; do
+    # Native bash parameter expansion (instantaneous, no fork/basename/dirname)
+    name="${dir##*/}"
+    parent="${dir%/*}"
+    parent_name="${parent##*/}"
+    printf "%s/%s\t%s\n" "$parent_name" "$name" "$dir"
   done
 
-  find "$HOME/Projects"/*/.worktrees -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r dir; do
-    parent_repo=$(basename "$(dirname "$(dirname "$dir")")")
-    wt_name=$(basename "$dir")
-    printf "Projects/%s [wt: %s]\t%s\n" "$parent_repo" "$wt_name" "$dir"
+  # 2. Worktrees only (direct path depth check, no glob expansion)
+  find "$HOME/Projects" -mindepth 3 -maxdepth 3 -type d -path '*/.worktrees/*' 2>/dev/null | while read -r dir; do
+    wt_name="${dir##*/}"
+    dot_wt="${dir%/*}"
+    repo_dir="${dot_wt%/*}"
+    repo_name="${repo_dir##*/}"
+    printf "Projects/%s [wt: %s]\t%s\n" "$repo_name" "$wt_name" "$dir"
   done
 )
 
@@ -20,23 +25,25 @@ SELECTED_LINE=$(echo -e "$CANDIDATES" | fzf --delimiter='\t' --with-nth=1)
 
 [[ -z "$SELECTED_LINE" ]] && exit 0
 
-PROJECT=$(echo "$SELECTED_LINE" | cut -f2)
+PROJECT="${SELECTED_LINE##*$'\t'}"
 
 if [[ "$PROJECT" == *"/.worktrees/"* ]]; then
-  PARENT_PROJ=$(basename "$(dirname "$(dirname "$PROJECT")")")
-  WT_NAME=$(basename "$PROJECT")
+  WT_NAME="${PROJECT##*/}"
+  TMP="${PROJECT%/*}"
+  REPO_DIR="${TMP%/*}"
+  PARENT_PROJ="${REPO_DIR##*/}"
 
   SESSION_NAME="wt_${PARENT_PROJ}__${WT_NAME}"
   IS_WORKTREE=true
 elif [[ "$PROJECT" == *"$HOME/.config"* ]]; then
-  SESSION_NAME="cfg_$(basename "$PROJECT" | tr . _)"
+  DIR_NAME="${PROJECT##*/}"
+  SESSION_NAME="cfg_${DIR_NAME//./_}"
   IS_WORKTREE=false
 else
-  SESSION_NAME=$(basename "$PROJECT" | tr . _)
+  DIR_NAME="${PROJECT##*/}"
+  SESSION_NAME="${DIR_NAME//./_}"
   IS_WORKTREE=false
 fi
-
-SESSION_NAME=$(echo "$SESSION_NAME" | tr . _)
 
 EXACT_SESSION=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -Fx "$SESSION_NAME")
 
