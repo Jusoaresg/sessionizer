@@ -1,0 +1,12 @@
+[package]
+name = "sessionizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+dirs = "7.0.0"
+fuzzy-matcher = "0.3.7"
+ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
