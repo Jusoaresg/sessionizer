@@ -200,28 +200,41 @@ impl App {
             }
 
             if query.is_empty() {
+                let running_score = if candidate.is_running { 100 } else { 0 };
+                let kind_score = if !matches!(candidate.kind, ItemKind::Config) { 10 } else { 0 };
                 results.push(FilteredItem {
                     candidate: candidate.clone(),
-                    score: if candidate.is_running { 100 } else { 0 },
+                    score: running_score + kind_score,
                     match_indices: Vec::new(),
                 });
             } else {
                 // Match against display name or session name
                 let text_to_match = format!("{} {}", candidate.display_name, candidate.session_name);
                 if let Some((score, indices)) = self.matcher.fuzzy_indices(&text_to_match, &query) {
-                    let boost = if candidate.is_running { 50 } else { 0 };
+                    let running_boost = if candidate.is_running { 50 } else { 0 };
+                    let kind_boost = if !matches!(candidate.kind, ItemKind::Config) { 10 } else { 0 };
                     results.push(FilteredItem {
                         candidate: candidate.clone(),
-                        score: score + boost,
+                        score: score + running_boost + kind_boost,
                         match_indices: indices,
                     });
                 }
             }
         }
 
-        // Sort by score descending
+        // Sort by score descending, breaking ties by kind priority then display name
         if !query.is_empty() {
-            results.sort_by(|a, b| b.score.cmp(&a.score));
+            results.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| a.candidate.kind.priority().cmp(&b.candidate.kind.priority()))
+                    .then_with(|| {
+                        a.candidate
+                            .display_name
+                            .to_lowercase()
+                            .cmp(&b.candidate.display_name.to_lowercase())
+                    })
+            });
         }
 
         self.filtered_items = results;
@@ -735,5 +748,62 @@ pub fn delete_word(s: &mut String) {
             break;
         }
         s.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_tab_prioritizes_projects_over_configs() {
+        let config = Config::default();
+        let mut app = App {
+            config,
+            all_candidates: vec![
+                Candidate {
+                    display_name: "Projects/sessionizer".into(),
+                    session_name: "sessionizer".into(),
+                    path: PathBuf::from("/home/user/Projects/sessionizer"),
+                    kind: ItemKind::Project,
+                    is_running: false,
+                    is_attached: false,
+                    windows_count: None,
+                },
+                Candidate {
+                    display_name: ".config/sessionizer".into(),
+                    session_name: "cfg_sessionizer".into(),
+                    path: PathBuf::from("/home/user/.config/sessionizer"),
+                    kind: ItemKind::Config,
+                    is_running: false,
+                    is_attached: false,
+                    windows_count: None,
+                },
+            ],
+            filtered_items: Vec::new(),
+            selected_index: 0,
+            search_query: String::new(),
+            current_tab: FilterTab::All,
+            show_preview: false,
+            status_message: None,
+            modal: Modal::None,
+            action: ActionToExecute::None,
+            cached_preview_target: None,
+            cached_preview: PreviewInfo::default(),
+            matcher: SkimMatcherV2::default(),
+        };
+
+        // Without query on All tab
+        app.apply_filter();
+        assert_eq!(app.filtered_items.len(), 2);
+        assert_eq!(app.filtered_items[0].candidate.kind, ItemKind::Project);
+        assert_eq!(app.filtered_items[1].candidate.kind, ItemKind::Config);
+
+        // With search query matching both
+        app.search_query = "sessionizer".into();
+        app.apply_filter();
+        assert_eq!(app.filtered_items.len(), 2);
+        assert_eq!(app.filtered_items[0].candidate.kind, ItemKind::Project);
+        assert_eq!(app.filtered_items[1].candidate.kind, ItemKind::Config);
     }
 }

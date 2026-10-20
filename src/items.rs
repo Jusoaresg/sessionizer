@@ -8,6 +8,17 @@ pub enum ItemKind {
     Config,
 }
 
+impl ItemKind {
+    pub fn priority(&self) -> u8 {
+        match self {
+            ItemKind::ActiveSession => 0,
+            ItemKind::Project => 0,
+            ItemKind::Worktree { .. } => 0,
+            ItemKind::Config => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub display_name: String,

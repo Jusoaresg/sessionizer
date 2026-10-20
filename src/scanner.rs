@@ -166,12 +166,16 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
         }
     }
 
-    // 5. Sort: running sessions first, then alphabetical by display name
+    // 5. Sort: running sessions first, then projects over configs, then alphabetical by display name
     candidates.sort_by(|a, b| {
         match (a.is_running, b.is_running) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()),
+            _ => a
+                .kind
+                .priority()
+                .cmp(&b.kind.priority())
+                .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
         }
     });
 
@@ -212,6 +216,65 @@ mod tests {
                 c.is_running
             );
         }
+    }
+
+    #[test]
+    fn test_project_priority_over_configs() {
+        let mut candidates = vec![
+            Candidate {
+                display_name: ".config/nvim".into(),
+                session_name: "cfg_nvim".into(),
+                path: PathBuf::from("/home/user/.config/nvim"),
+                kind: ItemKind::Config,
+                is_running: false,
+                is_attached: false,
+                windows_count: None,
+            },
+            Candidate {
+                display_name: "Projects/sessionizer".into(),
+                session_name: "sessionizer".into(),
+                path: PathBuf::from("/home/user/Projects/sessionizer"),
+                kind: ItemKind::Project,
+                is_running: false,
+                is_attached: false,
+                windows_count: None,
+            },
+            Candidate {
+                display_name: ".config/alacritty".into(),
+                session_name: "cfg_alacritty".into(),
+                path: PathBuf::from("/home/user/.config/alacritty"),
+                kind: ItemKind::Config,
+                is_running: true,
+                is_attached: false,
+                windows_count: None,
+            },
+            Candidate {
+                display_name: "Projects/my-app".into(),
+                session_name: "my-app".into(),
+                path: PathBuf::from("/home/user/Projects/my-app"),
+                kind: ItemKind::Project,
+                is_running: true,
+                is_attached: false,
+                windows_count: None,
+            },
+        ];
+
+        candidates.sort_by(|a, b| {
+            match (a.is_running, b.is_running) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a
+                    .kind
+                    .priority()
+                    .cmp(&b.kind.priority())
+                    .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
+            }
+        });
+
+        assert_eq!(candidates[0].display_name, "Projects/my-app");
+        assert_eq!(candidates[1].display_name, ".config/alacritty");
+        assert_eq!(candidates[2].display_name, "Projects/sessionizer");
+        assert_eq!(candidates[3].display_name, ".config/nvim");
     }
 }
 
