@@ -1,12 +1,49 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::items::{Candidate, ItemKind};
 use crate::tmux;
 
-pub fn scan_all(config: &Config) -> Vec<Candidate> {
+type WorktreeCache = HashMap<PathBuf, (Instant, Vec<PathBuf>)>;
+
+pub struct BackgroundScanner {
+    requests: std::sync::mpsc::Sender<Config>,
+    results: std::sync::mpsc::Receiver<Vec<Candidate>>,
+}
+
+impl BackgroundScanner {
+    pub fn new() -> Self {
+        let (requests, incoming) = std::sync::mpsc::channel::<Config>();
+        let (outgoing, results) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cache = WorktreeCache::new();
+            while let Ok(config) = incoming.recv() {
+                if outgoing.send(scan_all(&config, &mut cache)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { requests, results }
+    }
+
+    pub fn request(&self, config: Config) {
+        let _ = self.requests.send(config);
+    }
+
+    pub fn poll(&self) -> Option<Vec<Candidate>> {
+        self.results.try_recv().ok()
+    }
+}
+
+fn scan_all(config: &Config, cache: &mut WorktreeCache) -> Vec<Candidate> {
     let active_sessions = tmux::list_active_sessions();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
@@ -17,9 +54,7 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
             continue;
         }
 
-        let is_config_dir = base
-            .to_string_lossy()
-            .contains(".config");
+        let is_config_dir = base.to_string_lossy().contains(".config");
 
         let Ok(entries) = fs::read_dir(base) else {
             continue;
@@ -45,10 +80,7 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
                 continue;
             }
 
-            let parent_name = base
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let parent_name = base.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             let (display_name, session_name, kind) = if is_config_dir {
                 (
@@ -64,7 +96,9 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
                 )
             };
 
-            seen_paths.insert(path.clone());
+            if !seen_paths.insert(fs::canonicalize(&path).unwrap_or_else(|_| path.clone())) {
+                continue;
+            }
             candidates.push(Candidate {
                 display_name,
                 session_name,
@@ -77,60 +111,92 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
         }
     }
 
-    // 2. Scan git worktrees if enabled
+    // Ask Git for registered worktrees, independent of their directory layout.
     if config.scan_worktrees {
-        for base in &config.paths {
-            if !base.is_dir() {
-                continue;
-            }
-
-            let Ok(repo_entries) = fs::read_dir(base) else {
-                continue;
-            };
-
-            for repo_entry in repo_entries.flatten() {
-                let repo_path = repo_entry.path();
-                let worktrees_dir = repo_path.join(".worktrees");
-                if !worktrees_dir.is_dir() {
+        let repos: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|c| {
+                c.path.join(".git").exists()
+                    || c.path.join("HEAD").is_file() && c.path.join("objects").is_dir()
+            })
+            .map(|c| c.path.clone())
+            .collect();
+        cache.retain(|path, _| repos.contains(path));
+        let mut discovered = Vec::new();
+        let mut pending = Vec::new();
+        for repo in repos {
+            if let Some((time, paths)) = cache.get(&repo) {
+                if time.elapsed() < Duration::from_secs(10) {
+                    discovered.push((repo, paths.clone()));
                     continue;
                 }
-
-                let repo_name = match repo_path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-
-                let Ok(wt_entries) = fs::read_dir(&worktrees_dir) else {
-                    continue;
-                };
-
-                for wt_entry in wt_entries.flatten() {
-                    let wt_path = wt_entry.path();
-                    if !wt_path.is_dir() {
-                        continue;
+            }
+            pending.push(repo);
+        }
+        let next = AtomicUsize::new(0);
+        let results = Mutex::new(Vec::new());
+        // Bound process creation even when the project list is large.
+        std::thread::scope(|scope| {
+            for _ in 0..pending.len().min(4) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(repo) = pending.get(index) else {
+                            break;
+                        };
+                        let paths = list_worktrees(repo);
+                        results.lock().unwrap().push((repo.clone(), paths));
                     }
-
-                    let wt_name = match wt_path.file_name().and_then(|n| n.to_str()) {
-                        Some(n) => n.to_string(),
-                        None => continue,
-                    };
-
-                    let display_name = format!("Projects/{} [wt: {}]", repo_name, wt_name);
-                    let session_name = format!("wt_{}__{}", repo_name, wt_name);
-
-                    seen_paths.insert(wt_path.clone());
-                    candidates.push(Candidate {
-                        display_name,
-                        session_name,
-                        path: wt_path,
-                        kind: ItemKind::Worktree {
-                            parent_repo: repo_name.clone(),
-                            wt_name,
-                        },
-                        is_running: false,
-                        is_attached: false,
-                        windows_count: None,
-                    });
+                });
+            }
+        });
+        for (repo, paths) in results.into_inner().unwrap() {
+            if let Some(paths) = paths {
+                cache.insert(repo.clone(), (Instant::now(), paths.clone()));
+                discovered.push((repo, paths));
+            }
+        }
+        discovered.sort_by(|a, b| {
+            b.0.join(".git")
+                .is_dir()
+                .cmp(&a.0.join(".git").is_dir())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut seen_worktrees = HashSet::new();
+        for (repo, paths) in discovered {
+            let repo_name = repo.file_name().unwrap_or_default().to_string_lossy();
+            for path in paths {
+                if !path.is_dir() {
+                    continue;
+                }
+                let identity = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if !seen_worktrees.insert(identity) {
+                    continue;
+                }
+                let wt_name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let candidate = Candidate {
+                    display_name: format!("{} [wt: {}]", repo_name, wt_name),
+                    session_name: format!("wt_{}__{}", repo_name, wt_name),
+                    path,
+                    kind: ItemKind::Worktree {
+                        parent_repo: repo_name.to_string(),
+                        wt_name,
+                    },
+                    is_running: false,
+                    is_attached: false,
+                    windows_count: None,
+                };
+                if let Some(existing) = candidates
+                    .iter_mut()
+                    .find(|c| paths_match(&c.path, &candidate.path))
+                {
+                    *existing = candidate;
+                } else {
+                    candidates.push(candidate);
                 }
             }
         }
@@ -167,19 +233,50 @@ pub fn scan_all(config: &Config) -> Vec<Candidate> {
     }
 
     // 5. Sort: running sessions first, then projects over configs, then alphabetical by display name
-    candidates.sort_by(|a, b| {
-        match (a.is_running, b.is_running) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a
-                .kind
-                .priority()
-                .cmp(&b.kind.priority())
-                .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
-        }
+    candidates.sort_by(|a, b| match (a.is_running, b.is_running) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.kind.priority().cmp(&b.kind.priority()).then_with(|| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        }),
     });
 
     candidates
+}
+
+fn list_worktrees(repo: &Path) -> Option<Vec<PathBuf>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_worktrees(&output.stdout))
+}
+
+fn parse_worktrees(output: &[u8]) -> Vec<PathBuf> {
+    output
+        .split(|b| *b == 0)
+        .filter_map(|field| field.strip_prefix(b"worktree "))
+        // Git lists the main checkout (or bare repository) first.
+        .skip(1)
+        .map(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(path))
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from(String::from_utf8_lossy(path).into_owned())
+            }
+        })
+        .collect()
 }
 
 fn paths_match(p1: &Path, p2: &Path) -> bool {
@@ -198,13 +295,90 @@ mod tests {
     use crate::config::load_config;
 
     #[test]
+    fn parses_nul_delimited_paths_and_excludes_main_checkout() {
+        let output = b"worktree /repo\0HEAD abc\0branch refs/heads/main\0\0worktree /outside/a b\nfeature\0HEAD abc\0detached\0\0";
+        assert_eq!(
+            parse_worktrees(output),
+            vec![PathBuf::from("/outside/a b\nfeature")]
+        );
+        assert!(parse_worktrees(b"").is_empty());
+    }
+
+    #[test]
+    fn discovers_registered_worktrees_outside_conventional_folder() {
+        let root = std::env::temp_dir().join(format!(
+            "sessionizer-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let projects = root.join("projects");
+        let repo = projects.join("repo");
+        let external = root.join("elsewhere/feature with spaces");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        git(&["worktree", "add", "--detach", external.to_str().unwrap()]);
+        let sibling = projects.join("a-sibling");
+        git(&["worktree", "add", "--detach", sibling.to_str().unwrap()]);
+        fs::create_dir_all(repo.join(".worktrees/not-registered")).unwrap();
+        let config = Config {
+            paths: vec![projects.clone(), projects],
+            ..Config::default()
+        };
+        let mut cache = WorktreeCache::new();
+        let candidates = scan_all(&config, &mut cache);
+        let worktrees: Vec<_> = candidates.iter().filter(|c| c.is_worktree()).collect();
+        assert_eq!(worktrees.len(), 2);
+        assert!(worktrees.iter().any(|c| c.path == external));
+        assert!(worktrees.iter().any(|c| c.path == sibling));
+        assert!(worktrees.iter().all(
+            |c| matches!(&c.kind, ItemKind::Worktree { parent_repo, .. } if parent_repo == "repo")
+        ));
+        assert_eq!(cache.len(), 2);
+        // Missing worktrees are filtered even while their Git records are cached.
+        fs::remove_dir_all(&external).unwrap();
+        assert!(
+            !scan_all(&config, &mut cache)
+                .iter()
+                .any(|c| c.path == external)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn test_scanner_discovers_items() {
         let config = load_config();
-        let candidates = scan_all(&config);
+        let candidates = scan_all(&config, &mut WorktreeCache::new());
         assert!(!candidates.is_empty(), "Should discover candidates");
         println!("Discovered {} candidates:", candidates.len());
         for c in &candidates {
-            println!("  [{}] {} -> session: {} (running: {})", 
+            println!(
+                "  [{}] {} -> session: {} (running: {})",
                 match c.kind {
                     ItemKind::Worktree { .. } => "WT",
                     ItemKind::Config => "CFG",
@@ -259,16 +433,14 @@ mod tests {
             },
         ];
 
-        candidates.sort_by(|a, b| {
-            match (a.is_running, b.is_running) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a
-                    .kind
-                    .priority()
-                    .cmp(&b.kind.priority())
-                    .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase())),
-            }
+        candidates.sort_by(|a, b| match (a.is_running, b.is_running) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.kind.priority().cmp(&b.kind.priority()).then_with(|| {
+                a.display_name
+                    .to_lowercase()
+                    .cmp(&b.display_name.to_lowercase())
+            }),
         });
 
         assert_eq!(candidates[0].display_name, "Projects/my-app");
@@ -277,4 +449,3 @@ mod tests {
         assert_eq!(candidates[3].display_name, ".config/nvim");
     }
 }
-

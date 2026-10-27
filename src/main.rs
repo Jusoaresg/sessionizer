@@ -26,11 +26,14 @@ fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
 
     loop {
+        app.poll_scan();
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == event::KeyEventKind::Press {
-                app.handle_key(key.code, key.modifiers);
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == event::KeyEventKind::Press {
+                    app.handle_key(key.code, key.modifiers);
+                }
             }
         }
 

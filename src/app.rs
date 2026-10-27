@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crossterm::event::{KeyCode, KeyModifiers};
-use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::config::Config;
 use crate::items::{Candidate, ItemKind};
@@ -132,12 +132,16 @@ pub struct App {
     pub cached_preview_target: Option<String>,
     pub cached_preview: PreviewInfo,
 
+    scanner: Option<scanner::BackgroundScanner>,
+    scanning: bool,
     matcher: SkimMatcherV2,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let all_candidates = scanner::scan_all(&config);
+        let scanner = scanner::BackgroundScanner::new();
+        scanner.request(config.clone());
+        let all_candidates = Vec::new();
         let matcher = SkimMatcherV2::default();
 
         let mut app = Self {
@@ -148,11 +152,16 @@ impl App {
             search_query: String::new(),
             current_tab: FilterTab::All,
             show_preview: true,
-            status_message: None,
+            status_message: Some((
+                "Scanning projects and sessions…".into(),
+                std::time::Instant::now(),
+            )),
             modal: Modal::None,
             action: ActionToExecute::None,
             cached_preview_target: None,
             cached_preview: PreviewInfo::default(),
+            scanner: Some(scanner),
+            scanning: true,
             matcher,
         };
 
@@ -162,9 +171,23 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        self.all_candidates = scanner::scan_all(&self.config);
-        self.apply_filter();
-        self.set_status("Refreshed projects and sessions");
+        if !self.scanning {
+            if let Some(scanner) = &self.scanner {
+                scanner.request(self.config.clone());
+                self.scanning = true;
+                self.set_status("Scanning projects and sessions…");
+            }
+        }
+    }
+
+    pub fn poll_scan(&mut self) {
+        if let Some(candidates) = self.scanner.as_ref().and_then(|scanner| scanner.poll()) {
+            self.scanning = false;
+            self.all_candidates = candidates;
+            self.cached_preview_target = None;
+            self.apply_filter();
+            self.set_status("Refreshed projects and sessions");
+        }
     }
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
@@ -201,7 +224,11 @@ impl App {
 
             if query.is_empty() {
                 let running_score = if candidate.is_running { 100 } else { 0 };
-                let kind_score = if !matches!(candidate.kind, ItemKind::Config) { 10 } else { 0 };
+                let kind_score = if !matches!(candidate.kind, ItemKind::Config) {
+                    10
+                } else {
+                    0
+                };
                 results.push(FilteredItem {
                     candidate: candidate.clone(),
                     score: running_score + kind_score,
@@ -209,10 +236,15 @@ impl App {
                 });
             } else {
                 // Match against display name or session name
-                let text_to_match = format!("{} {}", candidate.display_name, candidate.session_name);
+                let text_to_match =
+                    format!("{} {}", candidate.display_name, candidate.session_name);
                 if let Some((score, indices)) = self.matcher.fuzzy_indices(&text_to_match, &query) {
                     let running_boost = if candidate.is_running { 50 } else { 0 };
-                    let kind_boost = if !matches!(candidate.kind, ItemKind::Config) { 10 } else { 0 };
+                    let kind_boost = if !matches!(candidate.kind, ItemKind::Config) {
+                        10
+                    } else {
+                        0
+                    };
                     results.push(FilteredItem {
                         candidate: candidate.clone(),
                         score: score + running_boost + kind_boost,
@@ -227,7 +259,12 @@ impl App {
             results.sort_by(|a, b| {
                 b.score
                     .cmp(&a.score)
-                    .then_with(|| a.candidate.kind.priority().cmp(&b.candidate.kind.priority()))
+                    .then_with(|| {
+                        a.candidate
+                            .kind
+                            .priority()
+                            .cmp(&b.candidate.kind.priority())
+                    })
                     .then_with(|| {
                         a.candidate
                             .display_name
@@ -271,7 +308,9 @@ impl App {
     }
 
     pub fn selected_item(&self) -> Option<&Candidate> {
-        self.filtered_items.get(self.selected_index).map(|item| &item.candidate)
+        self.filtered_items
+            .get(self.selected_index)
+            .map(|item| &item.candidate)
     }
 
     pub fn update_preview(&mut self) {
@@ -588,51 +627,49 @@ impl App {
                     _ => {}
                 }
             }
-            NewSessionFocus::FolderSelection => {
-                match code {
-                    KeyCode::Esc => {
-                        modal.focus = NewSessionFocus::SessionName;
-                    }
-                    KeyCode::Enter => {
-                        if modal.selected_option == 3 {
-                            modal.focus = NewSessionFocus::CustomPathInput;
-                        } else {
-                            self.confirm_new_session();
-                        }
-                    }
-                    KeyCode::Char('1') => modal.selected_option = 0,
-                    KeyCode::Char('2') => modal.selected_option = 1,
-                    KeyCode::Char('3') => modal.selected_option = 2,
-                    KeyCode::Char('4') => {
-                        modal.selected_option = 3;
-                        modal.focus = NewSessionFocus::CustomPathInput;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        modal.selected_option = (modal.selected_option + 1).min(3);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if modal.selected_option == 0 {
-                            modal.focus = NewSessionFocus::SessionName;
-                        } else {
-                            modal.selected_option = modal.selected_option - 1;
-                        }
-                    }
-                    KeyCode::BackTab => {
-                        modal.focus = NewSessionFocus::SessionName;
-                    }
-                    KeyCode::Tab => {
-                        if modal.selected_option == 3 {
-                            modal.focus = NewSessionFocus::CustomPathInput;
-                        } else {
-                            modal.selected_option = (modal.selected_option + 1) % 4;
-                        }
-                    }
-                    KeyCode::Char('g') | KeyCode::Char(' ') => {
-                        modal.init_git = !modal.init_git;
-                    }
-                    _ => {}
+            NewSessionFocus::FolderSelection => match code {
+                KeyCode::Esc => {
+                    modal.focus = NewSessionFocus::SessionName;
                 }
-            }
+                KeyCode::Enter => {
+                    if modal.selected_option == 3 {
+                        modal.focus = NewSessionFocus::CustomPathInput;
+                    } else {
+                        self.confirm_new_session();
+                    }
+                }
+                KeyCode::Char('1') => modal.selected_option = 0,
+                KeyCode::Char('2') => modal.selected_option = 1,
+                KeyCode::Char('3') => modal.selected_option = 2,
+                KeyCode::Char('4') => {
+                    modal.selected_option = 3;
+                    modal.focus = NewSessionFocus::CustomPathInput;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    modal.selected_option = (modal.selected_option + 1).min(3);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if modal.selected_option == 0 {
+                        modal.focus = NewSessionFocus::SessionName;
+                    } else {
+                        modal.selected_option = modal.selected_option - 1;
+                    }
+                }
+                KeyCode::BackTab => {
+                    modal.focus = NewSessionFocus::SessionName;
+                }
+                KeyCode::Tab => {
+                    if modal.selected_option == 3 {
+                        modal.focus = NewSessionFocus::CustomPathInput;
+                    } else {
+                        modal.selected_option = (modal.selected_option + 1) % 4;
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Char(' ') => {
+                    modal.init_git = !modal.init_git;
+                }
+                _ => {}
+            },
             NewSessionFocus::CustomPathInput => {
                 if modifiers.contains(KeyModifiers::CONTROL)
                     && (code == KeyCode::Char('w')
@@ -790,6 +827,8 @@ mod tests {
             action: ActionToExecute::None,
             cached_preview_target: None,
             cached_preview: PreviewInfo::default(),
+            scanner: None,
+            scanning: false,
             matcher: SkimMatcherV2::default(),
         };
 
